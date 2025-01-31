@@ -196,7 +196,6 @@ class TeamOptimizer:
 
         # Solve
         status = solver.Solve()
-        print(f"status: {status}")
 
         if status == pywraplp.Solver.OPTIMAL:
             # Extract solution

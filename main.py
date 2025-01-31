@@ -23,7 +23,6 @@ async def optimize(gameweeks: List[int], points_column: Optional[str] = "form"):
         result = optimizer.optimize(gamedays=[93, 94, 95, 96, 97, 98, 99], points_column=points_column)
         return result
     except Exception as e:
-        print(f'error: {e}')
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
