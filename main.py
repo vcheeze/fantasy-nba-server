@@ -1,34 +1,55 @@
 from datetime import date
 from enum import Enum
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from httpx_client import HTTPXClient
 from ortools.linear_solver import pywraplp
 from pydantic import BaseModel
 from solver import TeamOptimizer
 from typing import Dict, List, Optional, Tuple
 
+
 httpx_client = HTTPXClient()
 app = FastAPI()
+
+origins = [
+    "http://localhost:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/optimize")
 async def optimize(gameweeks: List[int], points_column: Optional[str] = "form"):
     try:
         async_client = httpx_client()
-        data_response = await async_client.get("https://nbafantasy.nba.com/api/bootstrap-static/")
+        data_response = await async_client.get(
+            "https://nbafantasy.nba.com/api/bootstrap-static/"
+        )
         data = data_response.json()
-        fixtures_response = await async_client.get(f'https://nbafantasy.nba.com/api/fixtures/?phase={gameweeks[0]}')
+        fixtures_response = await async_client.get(
+            f"https://nbafantasy.nba.com/api/fixtures/?phase={gameweeks[0]}"
+        )
         fixtures = fixtures_response.json()
         optimizer = TeamOptimizer(data, fixtures)
-        result = optimizer.optimize(gamedays=[93, 94, 95, 96, 97, 98, 99], points_column=points_column)
+        result = optimizer.optimize(
+            gamedays=[93, 94, 95, 96, 97, 98, 99], points_column=points_column
+        )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
-    
+
 
 @app.on_event("startup")
 async def startup_event():
