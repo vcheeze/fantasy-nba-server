@@ -17,35 +17,40 @@ class TeamOptimizer:
         self.data = data
         self.fixtures = fixtures
         self.team_map = {team["id"]: team["short_name"] for team in data["teams"]}
-        self.player_map = {p["id"]: p for p in data["elements"]}
+        self.player_map = {p["id"]: p for p in data["elements"] if p["status"] == "a"}
+        self.team_games = self._create_team_game_schedule()
 
-    def get_player_games(self, gamedays: List[int]) -> Dict[int, List[str]]:
+    def _create_team_game_schedule(self) -> Dict[int, List[int]]:
+        """
+        Create a mapping of team IDs to their event numbers
+        """
+        team_games = defaultdict(list)
+        for fixture in self.fixtures:
+            team_games[fixture["team_h"]].append(fixture["event"])
+            team_games[fixture["team_a"]].append(fixture["event"])
+        return team_games
+
+    def get_player_games(self, gamedays: List[int]) -> Dict[int, List[int]]:
         """
         Compute games distribution per player for given gamedays
+        Only includes games where the player's team is actually playing
+        Returns a mapping of player_id to list of event numbers
         """
         player_games = defaultdict(list)
-        for fixture in self.fixtures:
-            if fixture["event"] in gamedays:
-                game_date = fixture["kickoff_time"][:10]
-                home_team_players = [
-                    p["id"]
-                    for p in self.data["elements"]
-                    if p["team"] == fixture["team_h"]
-                ]
-                away_team_players = [
-                    p["id"]
-                    for p in self.data["elements"]
-                    if p["team"] == fixture["team_a"]
-                ]
-
-                for player_id in home_team_players + away_team_players:
-                    player_games[player_id].append(game_date)
+        
+        for player_id, player in self.player_map.items():
+            team_id = player["team"]
+            for event in self.team_games[team_id]:
+                if event in gamedays:
+                    player_games[player_id].append(event)
+        
         return player_games
 
     def optimize(
         self,
         gamedays: List[int],
-        budget: int = 1000,
+        points_column: str = "form",
+        budget: int = 1007,
         num_players: int = 10,
         max_per_team: int = 2,
         num_front_court: int = 5,
@@ -53,7 +58,6 @@ class TeamOptimizer:
         max_daily_scorers: int = 5,
         min_pos_scorers: int = 2,
         max_pos_scorers: int = 3,
-        points_column: str = "form"
     ) -> Dict:
         """
         Optimize team selection and daily lineups with position-balanced scoring
@@ -64,9 +68,9 @@ class TeamOptimizer:
 
         # Get player game distribution
         player_games = self.get_player_games(gamedays)
-        unique_gamedays = sorted(
-            set(day for games in player_games.values() for day in games)
-        )
+        unique_gamedays = sorted(set(
+            event for events in player_games.values() for event in events
+        ))
 
         # Decision Variables
         player_vars = {}  # Squad selection
@@ -74,8 +78,7 @@ class TeamOptimizer:
         has_scorers = {}  # Whether we have any scorers on a given day
 
         # Create variables
-        for player in self.data["elements"]:
-            player_id = player["id"]
+        for player_id, player in self.player_map.items():
             player_vars[player_id] = solver.BoolVar(f"squad_{player_id}")
             scorer_vars[player_id] = {}
             for gameday in unique_gamedays:
@@ -209,7 +212,8 @@ class TeamOptimizer:
                         "points_per_game": float(self.player_map[p][points_column]),
                         "position": (
                             "Front Court"
-                            if self.player_map[p]["element_type"] == Position.FRONT_COURT.value
+                            if self.player_map[p]["element_type"]
+                            == Position.FRONT_COURT.value
                             else "Back Court"
                         ),
                         "cost": self.player_map[p]["now_cost"],
@@ -226,7 +230,8 @@ class TeamOptimizer:
                             "points": float(self.player_map[p][points_column]),
                             "position": (
                                 "Front Court"
-                                if self.player_map[p]["element_type"] == Position.FRONT_COURT.value
+                                if self.player_map[p]["element_type"]
+                                == Position.FRONT_COURT.value
                                 else "Back Court"
                             ),
                         }
