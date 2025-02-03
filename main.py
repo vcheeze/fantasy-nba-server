@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 httpx_client = HTTPXClient()
 app = FastAPI()
 
-origins = ["http://localhost:3000", "https://fantasy-nba.vercel.app/"]
+origins = ["http://localhost:3000", "https://fantasy-nba.vercel.app"]
 
 app.add_middleware(
     CORSMiddleware,
