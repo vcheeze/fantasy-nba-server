@@ -25,32 +25,30 @@ app.add_middleware(
 
 
 @app.post("/optimize")
-async def optimize(gameweeks: List[int], points_column: Optional[str] = "form"):
+async def optimize(gamedays: List[int], points_column: Optional[str] = "form"):
     try:
         async_client = httpx_client()
         data_response = await async_client.get(
             "https://nbafantasy.nba.com/api/bootstrap-static/"
         )
+        if data_response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail="Failed to fetch metadata.")
         data = data_response.json()
 
-        # Validate and collect all events first
-        events = []
-        for gameweek_id in gameweeks:
-            event = next(
-                (item for item in data["phases"] if item["id"] == gameweek_id), None
-            )
-            if not event:
-                raise HTTPException(
-                    status_code=404, detail=f"Event with ID {gameweek_id} not found"
-                )
-            events.append(event)
+        # Extract phase IDs based on gamedays
+        phase_ids = set()
+        for phase in data.get("phases", []):
+            if any(start <= day <= stop for day in gamedays for start, stop in [(phase["start_event"], phase["stop_event"])]):
+                phase_ids.add(phase["id"])
+        if not phase_ids:
+            raise HTTPException(status_code=404, detail="No matching phases found for the given gamedays.")
 
         # Fetch all fixtures in parallel
         fixture_tasks = [
             async_client.get(
                 f"https://nbafantasy.nba.com/api/fixtures/?phase={gameweek_id}"
             )
-            for gameweek_id in gameweeks
+            for gameweek_id in phase_ids
         ]
         fixture_responses = await gather(*fixture_tasks)
 
@@ -59,12 +57,8 @@ async def optimize(gameweeks: List[int], points_column: Optional[str] = "form"):
         for response in fixture_responses:
             all_fixtures.extend(response.json())
 
-        # Create list of all event numbers
-        event_numbers = []
-        for event in events:
-            event_numbers.extend(range(event["start_event"], event["stop_event"] + 1))
         optimizer = TeamOptimizer(data, all_fixtures)
-        result = optimizer.optimize(gamedays=event_numbers, points_column=points_column)
+        result = optimizer.optimize(gamedays=gamedays, points_column=points_column)
         return result
     except Exception as e:
         print(f"error :>> {e}")
