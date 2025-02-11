@@ -76,8 +76,10 @@ If you have any questions, ideas or suggestions regarding this application sampl
    - Budget of $1000
    - Should consist of exactly 10 players, with 5 Front Court and 5 Back Court players
    - No more than 2 players from the same team
+   - 2 free transfers are allowed per Gameweek, which can be used separately on any given Gameday. Each additional transfer costs -1000 points
+   - If the player is in the current squad, instead of using his `now_cost` to calculate against the total budget, we use the user's `selling_price` from the current squad API's `picks` field
 2. Scoring
-   - The season is divided into Gameweeks, which are then divided into Gamedays
+   - The season is divided into Gameweeks (phases), which are then divided into Gamedays (events)
    - Each Gameday, select exactly 5 players to start whose fantasy points count toward the total score
    - If more/fewer than 5 players have games on any given Gameday, they will score 0 points. Only the selected 5 starting players' points count toward the total score.
    - The 5 players have to consist of 2-3 Front Court and 2-3 Back Court players, and this formation cannot be broken
@@ -237,9 +239,78 @@ The fixtures are retrieved from another API, and they are linked with the `phase
 }
 ```
 
+The current squad come from an API that contains the following information:
+
+```json
+{
+  "picks": [
+    {
+      "element": 732,
+      "position": 1,
+      "selling_price": 58,
+      "multiplier": 1,
+      "purchase_price": 59,
+      "is_captain": false
+    },
+    {
+      "element": 588,
+      "position": 2,
+      "selling_price": 175,
+      "multiplier": 2,
+      "purchase_price": 173,
+      "is_captain": true
+    },
+    // ... rest of the picks
+  ],
+  "transfers": {
+    "cost": 1000,
+    "status": "cost",
+    "limit": 2,
+    "made": 0,
+    "bank": 1,
+    "value": 1013
+  }
+}
+```
+
 ## Goal
 
 Your goal is to design a solution to this problem using LP or MIP to maximize the total points scored given any date range by utilizing the data available and adhering to the constraints given.
+
+## Clarifying Questions
+
+1. Optimization Scope:
+
+- Question: Should the optimizer select a team for a single Gameweek, a fixed range of Gameweeks, or the entire season?
+  Anser: An array of Gameday IDs will be passed as arguments, which will determine the range to optimize for
+- Question: Do you want the optimizer to consider transfers across multiple Gameweeks dynamically?
+  Answer: Yes, if the Gameday IDs passed in consist of multiple Gameweeks, take transfers as well as potential hits into account, as long as points as maximized
+
+2. Scoring Mechanism Clarification:
+
+- Question: The optimizer selects exactly 5 starters per Gameday. Does this mean unused players don’t contribute at all to scoring?
+  Answer: Correct - unused players do not contribute to scoring even if they have games on any given day
+- Question: If fewer than 5 players are available on a Gameday, does the optimizer attempt to spread out the games, or does it just maximize total points over the selected range?
+  Answer: The tool needs to optimize overall points, which involves choosing players with the highest points based on their `form` or `points_per_game` dynamically (through function params), as well as spreading games out to ensure the most games are played by the players with the best form/points_per_game
+
+3. Point Calculation for Transfers:
+
+- Question: Are we penalizing additional transfers beyond the 2 free ones within a Gameweek with -100 points, as in your previous request?
+  Answer: Yes, we penalize additional transfers with -1000 points
+- Question: Should the optimizer attempt to preserve previous squad selections where beneficial (e.g., to avoid selling fees)?
+  Answer: The optimizer should consider the best free transfers that will allow the highest gain in points, even if that involves transfer penalization. It could also involve performing no transfers if that yields more points
+
+4. Solver Preference:
+
+- Question: Are you open to using Google OR-Tools, PuLP (CBC solver), or a commercial solver like Gurobi?
+  Answer: Only consider free solvers
+- Question: Would you like a fallback method in case a solver doesn’t find an optimal solution?
+  Answer: Yes, write a simple fallback if you can
+
+5. Runtime Expectations:
+
+- Question: Should the optimizer run quickly (seconds) for quick decision-making, or are longer runs (minutes) acceptable to get the best solution?
+  Answer: Priotize getting maximum points, then account for performance and efficiency
 
 ---
 

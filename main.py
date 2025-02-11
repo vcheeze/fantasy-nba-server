@@ -25,23 +25,36 @@ app.add_middleware(
 
 
 @app.post("/optimize")
-async def optimize(gamedays: List[int], points_column: Optional[str] = "form"):
+async def optimize(
+    gamedays: List[int],
+    points_column: Optional[str] = "form",
+    team_id: Optional[str] = None,
+):
     try:
         async_client = httpx_client()
         data_response = await async_client.get(
             "https://nbafantasy.nba.com/api/bootstrap-static/"
         )
         if data_response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="Failed to fetch metadata.")
+            raise HTTPException(
+                status_code=response.status_code, detail="Failed to fetch metadata."
+            )
         data = data_response.json()
 
         # Extract phase IDs based on gamedays
         phase_ids = set()
         for phase in data.get("phases", []):
-            if any(start <= day <= stop for day in gamedays for start, stop in [(phase["start_event"], phase["stop_event"])]):
+            if any(
+                start <= day <= stop
+                for day in gamedays
+                for start, stop in [(phase["start_event"], phase["stop_event"])]
+            ):
                 phase_ids.add(phase["id"])
         if not phase_ids:
-            raise HTTPException(status_code=404, detail="No matching phases found for the given gamedays.")
+            raise HTTPException(
+                status_code=404,
+                detail="No matching phases found for the given gamedays.",
+            )
 
         # Fetch all fixtures in parallel
         fixture_tasks = [
@@ -57,8 +70,28 @@ async def optimize(gamedays: List[int], points_column: Optional[str] = "form"):
         for response in fixture_responses:
             all_fixtures.extend(response.json())
 
-        optimizer = TeamOptimizer(data, all_fixtures)
-        result = optimizer.optimize(gamedays=gamedays, points_column=points_column)
+        # Get team details if team_id exists
+        # if team_id:
+        #     team_response = await async_client.get(
+        #         f"https://nbafantasy.nba.com/api/my-team/{team_id}"
+        #     )
+        #     if team_response.status_code == 301:
+        #         new_url = team_response.headers['Location']
+        #         print(f"Redirected to: {new_url}")
+        #     team_details = team_response.json()
+        #     print(f'team details :>> {team_details}')
+
+        optimizer = TeamOptimizer(
+            players=data["elements"],
+            fixtures=all_fixtures,
+            phases=data["phases"],
+            teams=data["teams"],
+            # current_squad=team_details["picks"] if team_details else None,
+        )
+        result = optimizer.optimize(
+            event_ids=gamedays,
+            # current_squad=team_details["picks"] if team_details else None,
+        )
         return result
     except Exception as e:
         print(f"error :>> {e}")
