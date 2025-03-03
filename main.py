@@ -1,17 +1,17 @@
 from asyncio import gather
-from datetime import date
-from enum import Enum
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from httpx_client import HTTPXClient
-from ortools.linear_solver import pywraplp
-from pydantic import BaseModel
-from solver import TeamOptimizer
-from typing import Dict, List, Optional, Tuple
+from solver import TeamOptimizer, Transfers
+from typing import Dict, List, Optional, Set
 
 
 httpx_client = HTTPXClient()
-app = FastAPI()
+app = FastAPI(
+    title="NBA Fantasy Optimizer API",
+    description="API for optimizing NBA fantasy teams",
+    version="1.0.0",
+)
 
 origins = ["http://localhost:3000", "https://fantasy-nba.vercel.app"]
 
@@ -24,90 +24,138 @@ app.add_middleware(
 )
 
 
+def get_phase_ids_for_gamedays(data: Dict, gamedays: List[int]) -> Set[int]:
+    """
+    Extract phase IDs that contain the specified gamedays.
+    
+    Args:
+        data: The bootstrap data containing phases
+        gamedays: List of gameday IDs to find phases for
+        
+    Returns:
+        Set of phase IDs that contain the specified gamedays
+    """
+    phase_ids = set()
+    for phase in data.get("phases", []):
+        start, stop = phase["start_event"], phase["stop_event"]
+        if any(start <= day <= stop for day in gamedays):
+            phase_ids.add(phase["id"])
+    return phase_ids
+
+
+async def fetch_fixtures(async_client, phase_ids: Set[int]) -> List[Dict]:
+    """
+    Fetch fixtures for all specified phase IDs in parallel.
+    
+    Args:
+        async_client: HTTP client for making requests
+        phase_ids: Set of phase IDs to fetch fixtures for
+        
+    Returns:
+        List of all fixtures from the specified phases
+    """
+    fixture_tasks = [
+        async_client.get(
+            f"https://nbafantasy.nba.com/api/fixtures/?phase={phase_id}"
+        )
+        for phase_id in phase_ids
+    ]
+    fixture_responses = await gather(*fixture_tasks)
+    
+    all_fixtures = []
+    for response in fixture_responses:
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code, 
+                detail=f"Failed to fetch fixtures for phase"
+            )
+        all_fixtures.extend(response.json())
+    
+    return all_fixtures
+
+
 @app.post("/optimize")
 async def optimize(
     gamedays: List[int],
     points_column: Optional[str] = "form",
-    team_id: Optional[str] = None,
+    picks: Optional[List[Dict]] = None,
+    transfers: Optional[Transfers] = None,
 ):
+    """
+    Optimize a fantasy team based on specified gamedays and constraints.
+    
+    Args:
+        gamedays: List of gameday IDs to optimize for
+        points_column: Metric to use for scoring (default: "form")
+        picks: Current squad selection (optional)
+        transfers: Transfer constraints (optional)
+        
+    Returns:
+        Optimized team selection
+    """
     try:
         async_client = httpx_client()
+        
+        # Fetch bootstrap data
         data_response = await async_client.get(
             "https://nbafantasy.nba.com/api/bootstrap-static/"
         )
         if data_response.status_code != 200:
             raise HTTPException(
-                status_code=response.status_code, detail="Failed to fetch metadata."
+                status_code=data_response.status_code, 
+                detail="Failed to fetch metadata."
             )
         data = data_response.json()
 
-        # Extract phase IDs based on gamedays
-        phase_ids = set()
-        for phase in data.get("phases", []):
-            if any(
-                start <= day <= stop
-                for day in gamedays
-                for start, stop in [(phase["start_event"], phase["stop_event"])]
-            ):
-                phase_ids.add(phase["id"])
+        # Get phase IDs for the specified gamedays
+        phase_ids = get_phase_ids_for_gamedays(data, gamedays)
         if not phase_ids:
             raise HTTPException(
                 status_code=404,
                 detail="No matching phases found for the given gamedays.",
             )
 
-        # Fetch all fixtures in parallel
-        fixture_tasks = [
-            async_client.get(
-                f"https://nbafantasy.nba.com/api/fixtures/?phase={gameweek_id}"
-            )
-            for gameweek_id in phase_ids
-        ]
-        fixture_responses = await gather(*fixture_tasks)
+        # Fetch fixtures for all relevant phases
+        all_fixtures = await fetch_fixtures(async_client, phase_ids)
 
-        # Combine all fixtures
-        all_fixtures = []
-        for response in fixture_responses:
-            all_fixtures.extend(response.json())
-
-        # Get team details if team_id exists
-        # if team_id:
-        #     team_response = await async_client.get(
-        #         f"https://nbafantasy.nba.com/api/my-team/{team_id}"
-        #     )
-        #     if team_response.status_code == 301:
-        #         new_url = team_response.headers['Location']
-        #         print(f"Redirected to: {new_url}")
-        #     team_details = team_response.json()
-        #     print(f'team details :>> {team_details}')
-
+        # Run optimization
         optimizer = TeamOptimizer(
             players=data["elements"],
             fixtures=all_fixtures,
             phases=data["phases"],
             teams=data["teams"],
-            # current_squad=team_details["picks"] if team_details else None,
+            scoring_metric=points_column,
+            current_squad=picks,
+            transfers=transfers,
         )
+        
         result = optimizer.optimize(
             event_ids=gamedays,
-            # current_squad=team_details["picks"] if team_details else None,
+            current_squad=picks,
         )
         return result
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions without modification
+        raise
     except Exception as e:
-        print(f"error :>> {e}")
+        print(f"Optimization error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "NBA Fantasy Optimizer"}
 
 
 @app.on_event("startup")
 async def startup_event():
+    """Initialize the HTTP client on application startup."""
     httpx_client.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    """Clean up resources on application shutdown."""
     await httpx_client.stop()
