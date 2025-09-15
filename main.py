@@ -27,11 +27,11 @@ app.add_middleware(
 def get_phase_ids_for_gamedays(data: Dict, gamedays: List[int]) -> Set[int]:
     """
     Extract phase IDs that contain the specified gamedays.
-    
+
     Args:
         data: The bootstrap data containing phases
         gamedays: List of gameday IDs to find phases for
-        
+
     Returns:
         Set of phase IDs that contain the specified gamedays
     """
@@ -46,31 +46,29 @@ def get_phase_ids_for_gamedays(data: Dict, gamedays: List[int]) -> Set[int]:
 async def fetch_fixtures(async_client, phase_ids: Set[int]) -> List[Dict]:
     """
     Fetch fixtures for all specified phase IDs in parallel.
-    
+
     Args:
         async_client: HTTP client for making requests
         phase_ids: Set of phase IDs to fetch fixtures for
-        
+
     Returns:
         List of all fixtures from the specified phases
     """
     fixture_tasks = [
-        async_client.get(
-            f"https://nbafantasy.nba.com/api/fixtures/?phase={phase_id}"
-        )
+        async_client.get(f"https://nbafantasy.nba.com/api/fixtures/?phase={phase_id}")
         for phase_id in phase_ids
     ]
     fixture_responses = await gather(*fixture_tasks)
-    
+
     all_fixtures = []
     for response in fixture_responses:
         if response.status_code != 200:
             raise HTTPException(
-                status_code=response.status_code, 
-                detail=f"Failed to fetch fixtures for phase"
+                status_code=response.status_code,
+                detail=f"Failed to fetch fixtures for phase",
             )
         all_fixtures.extend(response.json())
-    
+
     return all_fixtures
 
 
@@ -83,27 +81,27 @@ async def optimize(
 ):
     """
     Optimize a fantasy team based on specified gamedays and constraints.
-    
+
     Args:
         gamedays: List of gameday IDs to optimize for
         points_column: Metric to use for scoring (default: "form")
         picks: Current squad selection (optional)
         transfers: Transfer constraints (optional)
-        
+
     Returns:
         Optimized team selection
     """
     try:
         async_client = httpx_client()
-        
+
         # Fetch bootstrap data
         data_response = await async_client.get(
             "https://nbafantasy.nba.com/api/bootstrap-static/"
         )
         if data_response.status_code != 200:
             raise HTTPException(
-                status_code=data_response.status_code, 
-                detail="Failed to fetch metadata."
+                status_code=data_response.status_code,
+                detail="Failed to fetch metadata.",
             )
         data = data_response.json()
 
@@ -128,13 +126,13 @@ async def optimize(
             current_squad=picks,
             transfers=transfers,
         )
-        
+        print(f'picks:>> {picks}')
         result = optimizer.optimize(
             event_ids=gamedays,
             current_squad=picks,
         )
         return result
-        
+
     except HTTPException:
         # Re-raise HTTP exceptions without modification
         raise

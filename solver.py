@@ -92,6 +92,14 @@ class TeamOptimizer:
         self.config = config or OptimizationConfig()
         self.scoring_metric = scoring_metric
 
+        # Calculate free transfers from transfers info if available
+        self.free_transfers = (
+            transfers.limit - transfers.made
+            if transfers is not None
+            else self.config.FREE_TRANSFERS
+        )
+        # self.free_transfers = 2
+
         # Pre-compute team lookups before processing players
         self.team_lookup = {t["id"]: t for t in teams}
         self.team_names = {t["id"]: t["name"] for t in teams}
@@ -776,7 +784,7 @@ class TeamOptimizer:
                     len(transfers_by_event[event_id]["in"]) for event_id in phase_events
                 )
 
-                excess_transfers = max(0, phase_transfers - self.config.FREE_TRANSFERS)
+                excess_transfers = max(0, phase_transfers - self.free_transfers)
                 penalty = excess_transfers * self.config.TRANSFER_PENALTY
 
                 transfer_penalties[phase] = {
@@ -1060,7 +1068,7 @@ class TeamOptimizer:
             )
             model.Add(
                 phase_excess_transfers
-                >= phase_transfer_sum - self.config.FREE_TRANSFERS
+                >= phase_transfer_sum - self.free_transfers
             )
             model.Add(phase_excess_transfers >= 0)
 
