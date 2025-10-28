@@ -3,7 +3,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from httpx_client import HTTPXClient
 from solver import TeamOptimizer, Transfers
-from typing import Dict, List, Optional, Set
 
 
 httpx_client = HTTPXClient()
@@ -24,7 +23,7 @@ app.add_middleware(
 )
 
 
-def get_phase_ids_for_gamedays(data: Dict, gamedays: List[int]) -> Set[int]:
+def get_phase_ids_for_gamedays(data: dict, gamedays: list[int]) -> set[int]:
     """
     Extract phase IDs that contain the specified gamedays.
 
@@ -36,14 +35,16 @@ def get_phase_ids_for_gamedays(data: Dict, gamedays: List[int]) -> Set[int]:
         Set of phase IDs that contain the specified gamedays
     """
     phase_ids = set()
-    for phase in data.get("phases", []):
+    for phase in data.get("phases", [])[
+        1:
+    ]:  # Skip the first phase, which contains all Gamedays
         start, stop = phase["start_event"], phase["stop_event"]
         if any(start <= day <= stop for day in gamedays):
             phase_ids.add(phase["id"])
     return phase_ids
 
 
-async def fetch_fixtures(async_client, phase_ids: Set[int]) -> List[Dict]:
+async def fetch_fixtures(async_client, phase_ids: set[int]) -> list[dict]:
     """
     Fetch fixtures for all specified phase IDs in parallel.
 
@@ -74,10 +75,10 @@ async def fetch_fixtures(async_client, phase_ids: Set[int]) -> List[Dict]:
 
 @app.post("/optimize")
 async def optimize(
-    gamedays: List[int],
-    points_column: Optional[str] = "form",
-    picks: Optional[List[Dict]] = None,
-    transfers: Optional[Transfers] = None,
+    gamedays: list[int],
+    points_column: str | None = "form",
+    picks: list[dict] | None = None,
+    transfers: Transfers | None = None,
 ):
     """
     Optimize a fantasy team based on specified gamedays and constraints.
@@ -115,18 +116,20 @@ async def optimize(
 
         # Fetch fixtures for all relevant phases
         all_fixtures = await fetch_fixtures(async_client, phase_ids)
+        filtered_fixtures = [
+            fixture for fixture in all_fixtures if fixture["event"] in gamedays
+        ]
 
         # Run optimization
         optimizer = TeamOptimizer(
             players=data["elements"],
-            fixtures=all_fixtures,
+            fixtures=filtered_fixtures,
             phases=data["phases"],
             teams=data["teams"],
             scoring_metric=points_column,
             current_squad=picks,
             transfers=transfers,
         )
-        print(f'picks:>> {picks}')
         result = optimizer.optimize(
             event_ids=gamedays,
             current_squad=picks,

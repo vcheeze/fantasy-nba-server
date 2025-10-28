@@ -3,9 +3,8 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from functools import lru_cache
 from ortools.sat.python import cp_model
-from typing import Dict, NamedTuple, Optional, List, Tuple
-import copy
 import os
+from typing import NamedTuple, Optional
 
 
 class Position(Enum):
@@ -80,15 +79,16 @@ class Transfers:
 class TeamOptimizer:
     def __init__(
         self,
-        players: List[Dict],
-        fixtures: List[Dict],
-        phases: List[Dict],
-        teams: List[Dict],
+        players: list[dict],
+        fixtures: list[dict],
+        phases: list[dict],
+        teams: list[dict],
         scoring_metric: str = "form",
-        current_squad: Optional[List[Dict]] = None,
+        current_squad: Optional[list[dict]] = None,
         config: Optional[OptimizationConfig] = None,
         transfers: Optional[Transfers] = None,
     ):
+        print(f"transfers :>> {transfers}")
         self.config = config or OptimizationConfig()
         self.scoring_metric = scoring_metric
 
@@ -114,6 +114,9 @@ class TeamOptimizer:
 
         # Process data in optimal order
         self.players = self._process_players(players, current_squad)
+        # Create a player_map for fast ID lookups
+        self.player_map = {p.id: p for p in self.players}
+
         self.fixtures = self._process_fixtures(fixtures)
         self.phases = self._process_phases(phases)
 
@@ -129,8 +132,8 @@ class TeamOptimizer:
         self._gameweek_cache = {}
 
     def _process_players(
-        self, players: List[Dict], current_squad: Optional[List[Dict]]
-    ) -> List[Player]:
+        self, players: list[dict], current_squad: Optional[list[dict]]
+    ) -> list[Player]:
         """Process raw player data into Player objects."""
         current_squad_map = {
             p["element"]: p["selling_price"] for p in (current_squad or [])
@@ -151,7 +154,7 @@ class TeamOptimizer:
             if p["status"] in ["a", "d"] or p["id"] in current_squad_map
         ]
 
-    def _process_fixtures(self, fixtures: List[Dict]) -> List[Fixture]:
+    def _process_fixtures(self, fixtures: list[dict]) -> list[Fixture]:
         """Process fixtures with field filtering."""
         fixture_fields = {field.name for field in fields(Fixture)}
         return [
@@ -159,7 +162,7 @@ class TeamOptimizer:
             for f in fixtures
         ]
 
-    def _process_phases(self, phases: List[Dict]) -> List[Phase]:
+    def _process_phases(self, phases: list[dict]) -> list[Phase]:
         """Process phases with field filtering."""
         phase_fields = {field.name for field in fields(Phase)}
         return [
@@ -214,33 +217,41 @@ class TeamOptimizer:
         }
 
     def _create_optimization_model(
-        self, event_ids: List[int], current_squad: Optional[List[Dict]]
-    ) -> Tuple[cp_model.CpModel, Dict, Dict, Dict]:
+        self, event_ids: list[int]
+    ) -> tuple[cp_model.CpModel, dict, dict]:
         """Create CP-SAT model and variables."""
         model = cp_model.CpModel()
 
-        # Pre-allocate dictionaries with expected size
-        player_count = len(self.players)
-        event_count = len(event_ids)
+        player_vars = {}  # Boolean vars for FINAL squad selection
+        transfer_vars = {}  # Boolean vars for transfers (per gameweek for penalty)
+
+        # --- Multi-Stage Roster Variables ---
+        self.player_in_squad_vars = {}
+        self.event_transfer_in_vars = {}
+        self.event_transfer_out_vars = {}
+
+        # Batch variable creation
+        sorted_events = sorted(list(event_ids))
         gameweeks = {self._get_gameweek_for_event(e) for e in event_ids}
-        gameweek_count = len(gameweeks)
 
-        player_vars = {}  # Boolean vars for squad selection
-        starter_vars = {}  # Boolean vars for starting lineup each event
-        transfer_vars = {}  # Boolean vars for transfers
-
-        # Batch variable creation for better performance
         for player in self.players:
-            # Squad selection vars
+            # Final squad selection var
             player_vars[player.id] = model.NewBoolVar(f"player_{player.id}")
 
-            # Starting lineup vars for each event
-            for event_id in event_ids:
-                starter_vars[(player.id, event_id)] = model.NewBoolVar(
-                    f"starter_{player.id}_{event_id}"
+            for event_id in sorted_events:
+                # Squad status variable
+                self.player_in_squad_vars[(player.id, event_id)] = model.NewBoolVar(
+                    f"player_in_squad_{player.id}_{event_id}"
+                )
+                # Transfer variables
+                self.event_transfer_in_vars[(player.id, event_id)] = model.NewBoolVar(
+                    f"transfer_in_{player.id}_{event_id}"
+                )
+                self.event_transfer_out_vars[(player.id, event_id)] = model.NewBoolVar(
+                    f"transfer_out_{player.id}_{event_id}"
                 )
 
-            # Transfer vars for each gameweek
+            # Transfer vars for each gameweek (for penalty)
             for gw in gameweeks:
                 if gw is not None:  # Skip None values
                     transfer_vars[(player.id, gw)] = model.NewBoolVar(
@@ -250,7 +261,8 @@ class TeamOptimizer:
         # Add symmetry breaking constraints for similar players
         self._add_symmetry_breaking(model, player_vars)
 
-        return model, player_vars, starter_vars, transfer_vars
+        # Return model and only the relevant variable dictionaries
+        return model, player_vars, transfer_vars
 
     def _add_symmetry_breaking(self, model, player_vars):
         """Add symmetry breaking constraints as a separate method for clarity"""
@@ -276,63 +288,6 @@ class TeamOptimizer:
                             player_vars[players[i].id] >= player_vars[players[i + 1].id]
                         )
 
-    def _add_constraints(
-        self,
-        model: cp_model.CpModel,
-        player_vars: Dict,
-        starter_vars: Dict,
-        transfer_vars: Dict,
-        event_ids: List[int],
-        current_squad: Optional[List[Dict]],
-        wildcard: Optional[bool] = False,
-    ) -> None:
-        """Add constraints to the optimization model."""
-        objective_terms = []
-        sorted_events = sorted(event_ids)
-
-        # ===== 1. SQUAD COMPOSITION CONSTRAINTS =====
-        # Basic squad size constraint
-        model.Add(sum(player_vars.values()) == self.config.SQUAD_SIZE)
-
-        # Position balance constraints
-        for position, players in self.players_by_position.items():
-            count = (
-                self.config.FRONT_COURT_COUNT
-                if position == Position.FRONT_COURT
-                else self.config.BACK_COURT_COUNT
-            )
-            model.Add(sum(player_vars[p.id] for p in players) == count)
-
-        # Budget constraint for final squad
-        model.Add(
-            sum(player_vars[p.id] * p.get_cost() for p in self.players) <= self.budget
-        )
-
-        # Team limit constraint
-        for team_players in self.players_by_team.values():
-            model.Add(
-                sum(player_vars[p.id] for p in team_players)
-                <= self.config.MAX_PLAYERS_PER_TEAM
-            )
-
-        # ===== 2. TRANSFER CONSTRAINTS (if applicable) =====
-        if current_squad and not wildcard:
-            objective_terms.extend(
-                self._add_transfer_constraints(
-                    model, player_vars, event_ids, sorted_events, current_squad
-                )
-            )
-
-        # ===== 3. STARTING LINEUP CONSTRAINTS =====
-        for event_id in event_ids:
-            objective_terms.extend(
-                self._add_lineup_constraints(
-                    model, player_vars, starter_vars, event_id, current_squad, wildcard
-                )
-            )
-
-        return objective_terms
-
     def _add_transfer_constraints(
         self, model, player_vars, event_ids, sorted_events, current_squad
     ):
@@ -344,28 +299,8 @@ class TeamOptimizer:
         phases = defaultdict(list)
         for event_id in event_ids:
             phase = self._get_gameweek_for_event(event_id)
-            phases[phase].append(event_id)
-
-        # Pre-allocate all variables at once
-        self.event_transfer_in_vars = {}
-        self.event_transfer_out_vars = {}
-        self.player_in_squad_vars = {}
-
-        # Batch variable creation
-        for player in self.players:
-            for event_id in sorted_events:
-                # Squad status variable
-                self.player_in_squad_vars[(player.id, event_id)] = model.NewBoolVar(
-                    f"player_in_squad_{player.id}_{event_id}"
-                )
-
-                # Transfer variables
-                self.event_transfer_in_vars[(player.id, event_id)] = model.NewBoolVar(
-                    f"transfer_in_{player.id}_{event_id}"
-                )
-                self.event_transfer_out_vars[(player.id, event_id)] = model.NewBoolVar(
-                    f"transfer_out_{player.id}_{event_id}"
-                )
+            if phase:
+                phases[phase].append(event_id)
 
         # Set flag to indicate we created event transfer variables
         self._event_transfer_vars_created = True
@@ -414,513 +349,6 @@ class TeamOptimizer:
                 == self.event_transfer_in_vars[(player.id, first_event)]
             )
             model.Add(self.event_transfer_out_vars[(player.id, first_event)] == 0)
-
-    def _add_lineup_constraints(
-        self, model, player_vars, starter_vars, event_id, current_squad, wildcard
-    ):
-        """Add constraints related to starting lineups."""
-        objective_terms = []
-        playing_teams = self._get_playing_teams(event_id)
-
-        # Starting lineup size constraint
-        model.Add(
-            sum(starter_vars[(p.id, event_id)] for p in self.players)
-            <= self.config.STARTING_PLAYERS
-        )
-
-        # Position balance for starters
-        front_court_starters = sum(
-            starter_vars[(p.id, event_id)]
-            for p in self.players_by_position[Position.FRONT_COURT]
-        )
-        back_court_starters = sum(
-            starter_vars[(p.id, event_id)]
-            for p in self.players_by_position[Position.BACK_COURT]
-        )
-
-        model.Add(
-            front_court_starters + back_court_starters <= self.config.STARTING_PLAYERS
-        )
-        model.Add(front_court_starters <= 3)
-        model.Add(back_court_starters <= 3)
-
-        # Can only start players in the squad for this event
-        for player in self.players:
-            if current_squad and not wildcard and hasattr(self, "player_in_squad_vars"):
-                # Link starters to event-specific squad status
-                model.Add(
-                    starter_vars[(player.id, event_id)]
-                    <= self.player_in_squad_vars[(player.id, event_id)]
-                )
-            else:
-                # If no current squad or using wildcard, link to final squad
-                model.Add(starter_vars[(player.id, event_id)] <= player_vars[player.id])
-
-            # Add points to objective if team is playing
-            if player.team in playing_teams:
-                points = player.get_score(self.scoring_metric)
-                objective_terms.append(
-                    starter_vars[(player.id, event_id)] * self._scale_points(points)
-                )
-
-        return objective_terms
-
-    def optimize(
-        self,
-        event_ids: List[int],
-        current_squad: Optional[List[Dict]] = None,
-        wildcard: Optional[bool] = False,
-    ) -> Dict:
-        """
-        Optimize team selection for given events with performance optimizations.
-        """
-        # Early validation
-        if not event_ids:
-            return {"error": "No events provided for optimization"}
-
-        # If too many events, use incremental approach
-        if len(event_ids) > 7 and current_squad and not wildcard:
-            return self._incremental_optimize(event_ids, current_squad)
-
-        try:
-            # Create model and variables
-            print("Creating optimization model...")
-            model, player_vars, starter_vars, transfer_vars = (
-                self._create_optimization_model(event_ids, current_squad)
-            )
-
-            # Add constraints and get objective terms
-            print("Adding constraints and objective terms to the model...")
-            objective_terms = self._add_constraints(
-                model,
-                player_vars,
-                starter_vars,
-                transfer_vars,
-                event_ids,
-                current_squad,
-                wildcard,
-            )
-
-            # Set objective
-            model.Maximize(sum(objective_terms))
-
-            print("Configuring the model and adding hints...")
-            # Configure solver with optimized parameters
-            solver = cp_model.CpSolver()
-            solver.parameters.max_time_in_seconds = self.config.SOLVER_TIMEOUT
-            solver.parameters.linearization_level = 2
-            solver.parameters.cp_model_presolve = True
-            solver.parameters.cp_model_probing_level = 2
-
-            # For large problems, use more aggressive settings
-            if len(event_ids) > 3 or len(self.players) > 200:
-                solver.parameters.num_search_workers = min(8, os.cpu_count() or 4)
-                solver.parameters.log_search_progress = True
-
-            # Add hints for high-value players
-            self._add_solver_hints(model, player_vars, starter_vars, event_ids)
-
-            # Solve the model
-            print("Solving...")
-            status = solver.Solve(model)
-
-            # print(
-            #     "Statuses :>>",
-            #     cp_model.UNKNOWN,
-            #     cp_model.MODEL_INVALID,
-            #     cp_model.FEASIBLE,
-            #     cp_model.INFEASIBLE,
-            #     cp_model.OPTIMAL,
-            # )
-            print(f"Solver status :>> {status}")
-
-            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-                return self._process_solution(
-                    solver,
-                    player_vars,
-                    starter_vars,
-                    transfer_vars,
-                    event_ids,
-                    current_squad,
-                )
-
-        except Exception as e:
-            print(f"Optimization failed: {str(e)}")
-            import traceback
-
-            traceback.print_exc()
-
-        return self._fallback_solution(event_ids, current_squad)
-
-    def _add_solver_hints(self, model, player_vars, starter_vars, event_ids):
-        """Add hints to guide the solver toward good solutions."""
-        # Track which players we've already added hints for
-        hinted_players = set()
-
-        # Hint: Start with high-value players
-        for player in sorted(
-            self.players,
-            key=lambda p: p.get_score(self.scoring_metric) / p.get_cost(),
-            reverse=True,
-        )[
-            :20
-        ]:  # Focus on top 20 value players
-            if player.id not in hinted_players:
-                model.AddHint(player_vars[player.id], 1)
-                hinted_players.add(player.id)
-
-        # Hint: Start with players from teams that play in most events
-        team_event_counts = defaultdict(int)
-        for event_id in event_ids:
-            playing_teams = self._get_playing_teams(event_id)
-            for team_id in playing_teams:
-                team_event_counts[team_id] += 1
-
-        # Prioritize players from teams with most games
-        for team_id, count in sorted(
-            team_event_counts.items(), key=lambda x: x[1], reverse=True
-        ):
-            if count >= len(event_ids) * 0.7:  # Teams playing in at least 70% of events
-                for player in self.players_by_team[team_id][
-                    :5
-                ]:  # Top 5 players per team
-                    if player.id not in hinted_players:
-                        model.AddHint(player_vars[player.id], 1)
-                        hinted_players.add(player.id)
-
-    def _incremental_optimize(self, event_ids, current_squad):
-        """Solve the problem incrementally for large event sets."""
-        # Sort events chronologically
-        sorted_events = sorted(event_ids)
-
-        # Group events by phase - do this once
-        phases = defaultdict(list)
-        for event_id in sorted_events:
-            phase = self._get_gameweek_for_event(event_id)
-            phases[phase].append(event_id)
-
-        # Solve one phase at a time
-        current_result = None
-        all_transfers = {}
-        all_starters = {}
-
-        # Sequential optimization for phases
-        for phase, phase_events in sorted(phases.items()):
-            # Optimize for this phase only
-            phase_result = self._optimize_phase(phase_events, current_squad)
-
-            # Update current squad for next phase
-            current_squad = [
-                {"element": p["id"], "selling_price": p["cost"]}
-                for p in phase_result["squad"]
-            ]
-
-            # Collect results
-            all_transfers.update(phase_result["transfers_by_event"])
-            all_starters.update(phase_result["daily_starters"])
-
-            # Save last result
-            current_result = phase_result
-
-        # Combine results
-        if current_result:
-            current_result["transfers_by_event"] = all_transfers
-            current_result["daily_starters"] = all_starters
-            return current_result
-
-        return self._fallback_solution(event_ids, current_squad)
-
-    def _optimize_phase(self, event_ids, current_squad):
-        """Optimize for a single phase with a shorter timeout."""
-        # Create a copy of the optimizer with a shorter timeout
-        phase_config = copy.deepcopy(self.config)
-        phase_config.SOLVER_TIMEOUT = min(
-            60, self.config.SOLVER_TIMEOUT
-        )  # 60 seconds max per phase
-
-        # Use the standard optimization method but with shorter timeout
-        try:
-            model, player_vars, starter_vars, transfer_vars = (
-                self._create_optimization_model(event_ids, current_squad)
-            )
-
-            objective_terms = self._add_constraints(
-                model,
-                player_vars,
-                starter_vars,
-                transfer_vars,
-                event_ids,
-                current_squad,
-                False,  # No wildcard for incremental
-            )
-
-            model.Maximize(sum(objective_terms))
-
-            # Solve with optimized parameters
-            solver = cp_model.CpSolver()
-            solver.parameters.max_time_in_seconds = phase_config.SOLVER_TIMEOUT
-            solver.parameters.linearization_level = 2
-            solver.parameters.cp_model_presolve = True
-
-            # Add hints
-            self._add_solver_hints(model, player_vars, starter_vars, event_ids)
-
-            status = solver.Solve(model)
-
-            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-                return self._process_solution(
-                    solver,
-                    player_vars,
-                    starter_vars,
-                    transfer_vars,
-                    event_ids,
-                    current_squad,
-                )
-
-        except Exception as e:
-            print(f"Phase optimization failed: {str(e)}")
-
-        return self._fallback_solution(event_ids, current_squad)
-
-    def _process_solution(
-        self,
-        solver: cp_model.CpSolver,
-        player_vars: Dict,
-        starter_vars: Dict,
-        transfer_vars: Dict,
-        event_ids: List[int],
-        current_squad: Optional[List[Dict]],
-    ) -> Dict:
-        """Process optimization solution into result format."""
-        # Pre-compute player lookup for faster access
-        player_lookup = {p.id: p for p in self.players}
-
-        # Cache solver.Value calls for better performance
-        value_cache = {}
-
-        def get_value(var):
-            if var not in value_cache:
-                value_cache[var] = solver.Value(var)
-            return value_cache[var]
-
-        # Get selected players in one pass
-        selected_player_ids = [
-            p_id for p_id, var in player_vars.items() if get_value(var) == 1
-        ]
-
-        selected_players = [
-            self._process_player_for_output(player_lookup[p_id])
-            for p_id in selected_player_ids
-        ]
-
-        # Process results for all events at once
-        starters_by_event = {}
-        transfers_by_event = {}
-
-        # Pre-compute event squads if needed
-        event_squads = {}
-        if current_squad and hasattr(self, "_event_transfer_vars_created"):
-            for event_id in event_ids:
-                event_squad_ids = [
-                    p.id
-                    for p in self.players
-                    if solver.Value(self.player_in_squad_vars[(p.id, event_id)]) == 1
-                ]
-                event_squads[event_id] = [
-                    self._process_player_for_output(player_lookup[p_id])
-                    for p_id in event_squad_ids
-                ]
-
-        # Process starters for all events
-        for event_id in event_ids:
-            # Get squad for this event
-            event_squad = event_squads.get(event_id, selected_players)
-
-            # Get starters efficiently
-            starter_ids = {
-                p["id"]
-                for p in event_squad
-                if solver.Value(starter_vars[(p["id"], event_id)]) == 1
-            }
-
-            starters = [p for p in event_squad if p["id"] in starter_ids]
-            starters_by_event[event_id] = starters
-
-        # Process transfers and penalties
-        total_transfers = 0
-        transfer_penalties = {}
-
-        if current_squad and hasattr(self, "_event_transfer_vars_created"):
-            # Process transfers for all events
-            for event_id in event_ids:
-                transfers_in = [
-                    self._process_player_for_output(p)
-                    for p in self.players
-                    if solver.Value(self.event_transfer_in_vars[(p.id, event_id)]) == 1
-                ]
-
-                transfers_out = [
-                    self._process_player_for_output(p)
-                    for p in self.players
-                    if solver.Value(self.event_transfer_out_vars[(p.id, event_id)]) == 1
-                ]
-
-                transfers_by_event[event_id] = {
-                    "in": transfers_in,
-                    "out": transfers_out,
-                    "count": len(transfers_in),
-                }
-
-                total_transfers += len(transfers_in)
-
-            # Calculate transfer penalties by phase
-            phases = defaultdict(list)
-            for event_id in event_ids:
-                phase = self._get_gameweek_for_event(event_id)
-                phases[phase].append(event_id)
-
-            for phase, phase_events in phases.items():
-                phase_transfers = sum(
-                    len(transfers_by_event[event_id]["in"]) for event_id in phase_events
-                )
-
-                excess_transfers = max(0, phase_transfers - self.free_transfers)
-                penalty = excess_transfers * self.config.TRANSFER_PENALTY
-
-                transfer_penalties[phase] = {
-                    "transfers": phase_transfers,
-                    "excess": excess_transfers,
-                    "penalty": penalty,
-                }
-
-        # Calculate points
-        raw_points = solver.ObjectiveValue() / 1000
-        total_penalty = (
-            sum(p["penalty"] for p in transfer_penalties.values())
-            if transfer_penalties
-            else 0
-        )
-        adjusted_points = raw_points - total_penalty
-
-        return {
-            "squad": selected_players,
-            "daily_starters": starters_by_event,
-            "transfers_by_event": transfers_by_event,
-            "transfer_summary": {
-                "total_transfers": total_transfers,
-                "penalties_by_phase": transfer_penalties,
-                "total_penalty": total_penalty,
-            },
-            "points": {
-                "raw_points": raw_points,
-                "transfer_penalty": total_penalty,
-                "adjusted_points": adjusted_points,
-            },
-            "total_cost": sum(p["cost"] for p in selected_players),
-            "average_points_per_day": (
-                adjusted_points / len(event_ids) if event_ids else 0
-            ),
-            "total_games": sum(
-                len(starters) for starters in starters_by_event.values()
-            ),
-        }
-
-    def _fallback_solution(
-        self, event_ids: List[int], current_squad: List[Dict] = None
-    ) -> Dict:
-        """
-        Simple greedy fallback solution if CP-SAT fails.
-        """
-        # Sort players by points per cost ratio
-        scoring_metric = "form" if self.scoring_metric == "form" else "points_per_game"
-        players_by_value = sorted(
-            self.players,
-            key=lambda p: getattr(p, scoring_metric) / p.now_cost,
-            reverse=True,
-        )
-
-        # Select squad greedily while respecting constraints
-        selected = []
-        total_cost = 0
-        team_counts = defaultdict(int)
-        front_court = 0
-        back_court = 0
-
-        for player in players_by_value:
-            if len(selected) >= self.config.SQUAD_SIZE:
-                break
-
-            cost = (
-                player.selling_price
-                if current_squad and player.selling_price
-                else player.now_cost
-            )
-
-            if (
-                total_cost + cost <= self.budget
-                and team_counts[player.team] < self.config.MAX_PLAYERS_PER_TEAM
-                and (
-                    (
-                        player.position == Position.FRONT_COURT
-                        and front_court < self.config.FRONT_COURT_COUNT
-                    )
-                    or (
-                        player.position == Position.BACK_COURT
-                        and back_court < self.config.BACK_COURT_COUNT
-                    )
-                )
-            ):
-                selected.append(player)
-                total_cost += cost
-                team_counts[player.team] += 1
-                if player.position == Position.FRONT_COURT:
-                    front_court += 1
-                else:
-                    back_court += 1
-
-        # Select starters greedily for each event
-        starters_by_event = {}
-        for event_id in event_ids:
-            playing_teams = self._get_playing_teams(event_id)
-            available_players = [p for p in selected if p.team in playing_teams]
-
-            # Sort by points
-            available_players.sort(
-                key=lambda p: getattr(p, scoring_metric), reverse=True
-            )
-
-            # Select starters while respecting position constraints
-            starters = []
-            front_court = 0
-            back_court = 0
-
-            for player in available_players:
-                if len(starters) >= self.config.STARTING_PLAYERS:
-                    break
-
-                if (player.position == Position.FRONT_COURT and front_court < 3) or (
-                    player.position == Position.BACK_COURT and back_court < 3
-                ):
-                    starters.append(player)
-                    if player.position == Position.FRONT_COURT:
-                        front_court += 1
-                    else:
-                        back_court += 1
-
-            starters_by_event[event_id] = starters
-
-        # Calculate expected points
-        expected_points = sum(
-            sum(getattr(p, scoring_metric) for p in starters_by_event[event_id])
-            for event_id in event_ids
-        )
-
-        return {
-            "squad": selected,
-            "daily_starters": starters_by_event,
-            "transfers_by_gameweek": {},  # No transfers in fallback
-            "expected_points": expected_points,
-        }
 
     def _add_squad_evolution_constraints(self, model, sorted_events):
         """Add constraints for squad evolution across events"""
@@ -1021,7 +449,7 @@ class TeamOptimizer:
         for event_id in sorted_events:
             event_squad_cost = model.NewIntVar(
                 0,
-                self.budget * 10,  # Multiply by 10 for safety margin
+                self.budget * 10,  # Use a reasonable upper bound
                 f"event_squad_cost_{event_id}",
             )
 
@@ -1038,9 +466,13 @@ class TeamOptimizer:
     def _add_transfer_penalties(self, model, phases):
         """Add transfer penalties to the objective function"""
         objective_terms = []
+        self._event_transfer_vars_created = True  # Flag for solution processing
 
         # Track transfers at phase level for penalty calculation
         for phase, phase_events in phases.items():
+            if not phase_events:
+                continue
+
             phase_transfers_in = []
 
             # Collect all transfers for the phase
@@ -1066,11 +498,11 @@ class TeamOptimizer:
                 len(self.players) * len(phase_events),
                 f"phase_excess_transfers_{phase}",
             )
-            model.Add(
-                phase_excess_transfers
-                >= phase_transfer_sum - self.free_transfers
+
+            # Use AddMaxEquality for max(0, sum - free)
+            model.AddMaxEquality(
+                phase_excess_transfers, [phase_transfer_sum - self.free_transfers, 0]
             )
-            model.Add(phase_excess_transfers >= 0)
 
             # Add transfer penalty to objective - scale it the same way as points
             objective_terms.append(
@@ -1079,3 +511,450 @@ class TeamOptimizer:
             )
 
         return objective_terms
+
+    def _add_objective_terms(
+        self, model: cp_model.CpModel, event_ids: list[int]
+    ) -> list:
+        """
+        Adds the objective terms to the model.
+        This implementation uses the 10-man roster score as a proxy.
+        """
+        objective_terms = []
+
+        for event_id in event_ids:
+            playing_teams = self._get_playing_teams(event_id)
+
+            for player in self.players:
+                if player.team in playing_teams:
+                    points = player.get_score(self.scoring_metric)
+                    scaled_points = self._scale_points(points)
+
+                    # Add points to objective if player is in the squad for this event
+                    objective_terms.append(
+                        self.player_in_squad_vars[(player.id, event_id)] * scaled_points
+                    )
+
+        return objective_terms
+
+    def _add_constraints(
+        self,
+        model: cp_model.CpModel,
+        player_vars: dict,
+        transfer_vars: dict,  # This variable is not actually used, but kept for signature consistency
+        event_ids: list[int],
+        current_squad: Optional[list[dict]],
+        wildcard: Optional[bool] = False,
+    ) -> list:
+        """Add constraints to the optimization model."""
+        objective_terms = []
+        sorted_events = sorted(event_ids)
+
+        # ===== 1. SQUAD COMPOSITION CONSTRAINTS (for FINAL squad) =====
+        # These constraints are applied to player_vars, which is the *final* roster.
+        # The per-event constraints are handled in the evolution/transfer logic.
+        model.Add(sum(player_vars.values()) == self.config.SQUAD_SIZE)
+
+        for position, players in self.players_by_position.items():
+            count = (
+                self.config.FRONT_COURT_COUNT
+                if position == Position.FRONT_COURT
+                else self.config.BACK_COURT_COUNT
+            )
+            model.Add(sum(player_vars[p.id] for p in players) == count)
+
+        model.Add(
+            sum(player_vars[p.id] * p.get_cost() for p in self.players) <= self.budget
+        )
+
+        for team_players in self.players_by_team.values():
+            model.Add(
+                sum(player_vars[p.id] for p in team_players)
+                <= self.config.MAX_PLAYERS_PER_TEAM
+            )
+
+        # ===== 2. TRANSFER/SQUAD EVOLUTION CONSTRAINTS (if applicable) =====
+        if current_squad and not wildcard:
+            objective_terms.extend(
+                self._add_transfer_constraints(
+                    model, player_vars, event_ids, sorted_events, current_squad
+                )
+            )
+        else:
+            # No current squad (build from scratch) or wildcard
+            # We still need to set up the evolution and link the final squad
+            self._add_squad_evolution_constraints(model, sorted_events)
+            self._add_final_squad_link_constraints(model, player_vars, sorted_events)
+
+            # Apply per-event constraints
+            self._add_transfer_balance_constraints(model, sorted_events)
+            self._add_position_balance_constraints(model, sorted_events)
+            self._add_budget_constraints(model, sorted_events)
+
+            # Group events by phase for penalty calculation
+            phases = defaultdict(list)
+            for event_id in event_ids:
+                phase = self._get_gameweek_for_event(event_id)
+                if phase:
+                    phases[phase].append(event_id)
+            objective_terms.extend(self._add_transfer_penalties(model, phases))
+
+        # ===== 3. OBJECTIVE FUNCTION TERMS (based on roster, not starters) =====
+        objective_terms.extend(self._add_objective_terms(model, event_ids))
+
+        return objective_terms
+
+    def optimize(
+        self,
+        event_ids: list[int],
+        current_squad: Optional[list[dict]] = None,
+        wildcard: Optional[bool] = False,
+    ) -> dict:
+        """
+        Optimize team selection for given events with performance optimizations.
+        """
+        # Early validation
+        if not event_ids:
+            return {"error": "No events provided for optimization"}
+
+        try:
+            # Create model and variables
+            print("Creating optimization model...")
+            model, player_vars, transfer_vars = self._create_optimization_model(
+                event_ids
+            )
+
+            # Add constraints and get objective terms
+            print("Adding constraints and objective terms to the model...")
+            objective_terms = self._add_constraints(
+                model,
+                player_vars,
+                transfer_vars,
+                event_ids,
+                current_squad,
+                wildcard,
+            )
+
+            # Set objective
+            model.Maximize(sum(objective_terms))
+
+            print("Configuring the model and adding hints...")
+            # Configure solver with optimized parameters
+            solver = cp_model.CpSolver()
+            solver.parameters.max_time_in_seconds = self.config.SOLVER_TIMEOUT
+            solver.parameters.linearization_level = 2
+            solver.parameters.cp_model_presolve = True
+            solver.parameters.cp_model_probing_level = 2
+
+            # For large problems, use more aggressive settings
+            if len(event_ids) > 3 or len(self.players) > 200:
+                solver.parameters.num_search_workers = min(8, os.cpu_count() or 4)
+                solver.parameters.log_search_progress = True
+
+            # Add hints for high-value players
+            self._add_solver_hints(model, player_vars, event_ids)
+
+            # Solve the model
+            print("Solving...")
+            status = solver.Solve(model)
+
+            print(f"Solver status :>> {status} ({solver.StatusName()})")
+
+            if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                return self._process_solution(
+                    solver,
+                    player_vars,
+                    transfer_vars,
+                    event_ids,
+                    current_squad,
+                )
+            else:
+                return {
+                    "status": "Infeasible",
+                    "solver": "cpsat",
+                    "error": "No solution found by the solver.",
+                }
+
+        except Exception as e:
+            print(f"Optimization failed: {str(e)}")
+            import traceback
+
+            traceback.print_exc()
+            return {
+                "status": "Error",
+                "solver": "cpsat",
+                "error": f"An exception occurred: {str(e)}",
+            }
+
+    def _add_solver_hints(self, model, player_vars, event_ids):
+        """Add hints to guide the solver toward good solutions."""
+        # Track which players we've already added hints for
+        hinted_players = set()
+
+        # Hint: Start with high-value players
+        for player in sorted(
+            self.players,
+            key=lambda p: (
+                p.get_score(self.scoring_metric) / p.get_cost()
+                if p.get_cost() > 0
+                else 0
+            ),
+            reverse=True,
+        )[
+            :20
+        ]:  # Focus on top 20 value players
+            if player.id not in hinted_players:
+                model.AddHint(player_vars[player.id], 1)
+                hinted_players.add(player.id)
+
+        # Hint: Start with players from teams that play in most events
+        team_event_counts = defaultdict(int)
+        for event_id in event_ids:
+            playing_teams = self._get_playing_teams(event_id)
+            for team_id in playing_teams:
+                team_event_counts[team_id] += 1
+
+        # Prioritize players from teams with most games
+        for team_id, count in sorted(
+            team_event_counts.items(), key=lambda x: x[1], reverse=True
+        ):
+            if count >= len(event_ids) * 0.7:  # Teams playing in at least 70% of events
+                for player in self.players_by_team.get(team_id, [])[
+                    :5
+                ]:  # Top 5 players per team
+                    if player.id not in hinted_players:
+                        model.AddHint(player_vars[player.id], 1)
+                        hinted_players.add(player.id)
+
+    def _calculate_true_gameday_score(
+        self, roster_player_ids: list[int], event_id: int
+    ) -> tuple[float, list[dict]]:
+        """
+        Calculates the *true* maximized score for a given 10-player roster
+        by finding the optimal 3-2 or 2-3 starting lineup for the gameday.
+        """
+        playing_type_1 = []  # Back Court
+        playing_type_2 = []  # Front Court
+
+        playing_teams = self._get_playing_teams(event_id)
+
+        for p_id in roster_player_ids:
+            # Use the fast player_map lookup
+            player = self.player_map.get(p_id)
+            if not player:
+                continue
+
+            if player.team in playing_teams:
+                # Use 'points_per_game' for actual scoring, not the optimization metric
+                ppg = player.points_per_game
+
+                player_data = {
+                    "id": player.id,
+                    "name": player.name,
+                    "team": self.team_short_names.get(player.team),
+                    "position": player.position,
+                    "points": ppg,
+                }
+
+                if player.position == Position.BACK_COURT:
+                    playing_type_1.append(player_data)
+                else:
+                    playing_type_2.append(player_data)
+
+        # Sort by points_per_game to easily find the top N
+        playing_type_1.sort(key=lambda x: x["points"], reverse=True)
+        playing_type_2.sort(key=lambda x: x["points"], reverse=True)
+
+        # Case 1: 3 Back Court (Type 1), 2 Front Court (Type 2)
+        score_3_2 = sum(p["points"] for p in playing_type_1[:3]) + sum(
+            p["points"] for p in playing_type_2[:2]
+        )
+        starters_3_2 = playing_type_1[:3] + playing_type_2[:2]
+
+        # Case 2: 2 Back Court (Type 1), 3 Front Court (Type 2)
+        score_2_3 = sum(p["points"] for p in playing_type_1[:2]) + sum(
+            p["points"] for p in playing_type_2[:3]
+        )
+        starters_2_3 = playing_type_1[:2] + playing_type_2[:3]
+
+        if score_3_2 >= score_2_3:
+            return score_3_2, starters_3_2
+        else:
+            return score_2_3, starters_2_3
+
+    def _process_solution(
+        self,
+        solver: cp_model.CpSolver,
+        player_vars: dict,
+        transfer_vars: dict,
+        event_ids: list[int],
+        current_squad: Optional[list[dict]],
+    ) -> dict:
+        """Process optimization solution into result format."""
+
+        # Get selected players for the *final* squad
+        final_player_ids = {
+            p_id for p_id, var in player_vars.items() if solver.Value(var) == 1
+        }
+        final_squad_players = [
+            self._process_player_for_output(self.player_map[p_id])
+            for p_id in final_player_ids
+            if p_id in self.player_map
+        ]
+
+        # --- Process results for all events at once ---
+        daily_starters = {}
+        all_gameday_rosters = {}
+        total_true_score = 0
+
+        sorted_events = sorted(list(event_ids))
+
+        # Check if the multi-stage variables were created
+        has_event_vars = (
+            hasattr(self, "_event_transfer_vars_created")
+            and self._event_transfer_vars_created
+        )
+
+        if has_event_vars:
+            for event_id in sorted_events:
+                event_squad_ids = [
+                    p.id
+                    for p in self.players
+                    if (p.id, event_id) in self.player_in_squad_vars
+                    and solver.Value(self.player_in_squad_vars[(p.id, event_id)]) == 1
+                ]
+                all_gameday_rosters[event_id] = [
+                    self._process_player_for_output(self.player_map[p_id])
+                    for p_id in event_squad_ids
+                    if p_id in self.player_map
+                ]
+
+                # Calculate true score for this event's roster
+                true_score, starters = self._calculate_true_gameday_score(
+                    event_squad_ids, event_id
+                )
+                total_true_score += true_score
+                daily_starters[event_id] = {"score": true_score, "starters": starters}
+        else:
+            # This block might be hit if current_squad=None and wildcard=True (not fully modeled)
+            # Fallback to assuming the final roster was used for all events
+            for event_id in sorted_events:
+                all_gameday_rosters[event_id] = final_squad_players
+                true_score, starters = self._calculate_true_gameday_score(
+                    final_player_ids, event_id
+                )
+                total_true_score += true_score
+                daily_starters[event_id] = {"score": true_score, "starters": starters}
+
+        # Collate transfers
+        transfers_by_event = {
+            event_id: {"in": [], "out": []} for event_id in sorted_events
+        }
+        paid_transfers_total = 0
+
+        if has_event_vars:
+            # Group events by phase
+            phases = defaultdict(list)
+            for event_id in event_ids:
+                phase = self._get_gameweek_for_event(event_id)
+                if phase:
+                    phases[phase].append(event_id)
+
+            for phase, phase_events in phases.items():
+                phase_transfers_in_count = 0
+                for event_id in phase_events:
+                    for player in self.players:
+                        if (
+                            solver.Value(
+                                self.event_transfer_in_vars[(player.id, event_id)]
+                            )
+                            == 1
+                        ):
+                            transfers_by_event[event_id]["in"].append(
+                                {
+                                    "phase": phase,
+                                    "player": self._process_player_for_output(player),
+                                }
+                            )
+                            phase_transfers_in_count += 1
+                        if (
+                            solver.Value(
+                                self.event_transfer_out_vars[(player.id, event_id)]
+                            )
+                            == 1
+                        ):
+                            transfers_by_event[event_id]["out"].append(
+                                {
+                                    "phase": phase,
+                                    "player": self._process_player_for_output(player),
+                                }
+                            )
+
+                paid_transfers_total += max(
+                    0, phase_transfers_in_count - self.free_transfers
+                )
+
+        elif current_squad:
+            # Fallback for simple case: Compare initial and final
+            current_squad_ids = {p["element"] for p in current_squad}
+            t_out_ids = current_squad_ids - final_player_ids
+            t_in_ids = final_player_ids - current_squad_ids
+
+            # Attach those transfers to the first event (best-effort single-event placement)
+            first_event = sorted_events[0] if sorted_events else None
+            phase_for_event = (
+                self._get_gameweek_for_event(first_event) if first_event else None
+            )
+
+            if first_event is not None:
+                for p_id in t_in_ids:
+                    if p_id in self.player_map:
+                        transfers_by_event[first_event]["in"].append(
+                            {
+                                "phase": phase_for_event,
+                                "player": self._process_player_for_output(
+                                    self.player_map[p_id]
+                                ),
+                            }
+                        )
+                for p_id in t_out_ids:
+                    if p_id in self.player_map:
+                        transfers_by_event[first_event]["out"].append(
+                            {
+                                "phase": phase_for_event,
+                                "player": self._process_player_for_output(
+                                    self.player_map[p_id]
+                                ),
+                            }
+                        )
+            paid_transfers_total = max(0, len(t_in_ids) - self.free_transfers)
+
+        # Filter out events that have no transfers at all
+        transfers_by_event = {
+            str(event_id): data
+            for event_id, data in transfers_by_event.items()
+            if data["in"] or data["out"]
+        }
+        total_transfers = sum(
+            len(transfers["in"]) for transfers in transfers_by_event.values()
+        )
+        total_games = sum(len(daily["starters"]) for daily in daily_starters.values())
+        average_points_per_day = total_true_score / len(sorted_events)
+
+        return {
+            "status": "Optimal" if solver.StatusName() == "OPTIMAL" else "Feasible",
+            # "solver": "cpsat",
+            "squad": final_squad_players,
+            # "all_gameday_rosters": all_gameday_rosters,
+            "total_cost": sum(p["cost"] for p in final_squad_players),
+            "solver_objective_value": solver.ObjectiveValue() / 1000.0,  # Rescale
+            "true_gameweek_score": total_true_score,
+            "total_games": total_games,
+            "daily_starters": daily_starters,
+            "average_points_per_day": average_points_per_day,
+            "transfers": {
+                "by_event": transfers_by_event,
+                "total": total_transfers,
+                "paid": paid_transfers_total,
+                "cost": paid_transfers_total * self.config.TRANSFER_PENALTY,
+            },
+        }
