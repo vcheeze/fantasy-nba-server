@@ -98,7 +98,7 @@ class TeamOptimizer:
             if transfers is not None
             else self.config.FREE_TRANSFERS
         )
-        # self.free_transfers = 2
+        # self.free_transfers = self.config.FREE_TRANSFERS
 
         # Pre-compute team lookups before processing players
         self.team_lookup = {t["id"]: t for t in teams}
@@ -223,7 +223,6 @@ class TeamOptimizer:
         model = cp_model.CpModel()
 
         player_vars = {}  # Boolean vars for FINAL squad selection
-        transfer_vars = {}  # Boolean vars for transfers (per gameweek for penalty)
 
         # --- Multi-Stage Roster Variables ---
         self.player_in_squad_vars = {}
@@ -251,18 +250,11 @@ class TeamOptimizer:
                     f"transfer_out_{player.id}_{event_id}"
                 )
 
-            # Transfer vars for each gameweek (for penalty)
-            for gw in gameweeks:
-                if gw is not None:  # Skip None values
-                    transfer_vars[(player.id, gw)] = model.NewBoolVar(
-                        f"transfer_{player.id}_{gw}"
-                    )
-
         # Add symmetry breaking constraints for similar players
         self._add_symmetry_breaking(model, player_vars)
 
         # Return model and only the relevant variable dictionaries
-        return model, player_vars, transfer_vars
+        return model, player_vars
 
     def _add_symmetry_breaking(self, model, player_vars):
         """Add symmetry breaking constraints as a separate method for clarity"""
@@ -499,9 +491,16 @@ class TeamOptimizer:
                 f"phase_excess_transfers_{phase}",
             )
 
+            # Determine free transfers for this phase
+            # First phase uses the provided transfers info, subsequent phases get fresh FREE_TRANSFERS
+            phase_free_transfers = (
+                self.free_transfers if phase == min(phases.keys())
+                else self.config.FREE_TRANSFERS
+            )
+
             # Use AddMaxEquality for max(0, sum - free)
             model.AddMaxEquality(
-                phase_excess_transfers, [phase_transfer_sum - self.free_transfers, 0]
+                phase_excess_transfers, [phase_transfer_sum - phase_free_transfers, 0]
             )
 
             # Add transfer penalty to objective - scale it the same way as points
@@ -540,7 +539,6 @@ class TeamOptimizer:
         self,
         model: cp_model.CpModel,
         player_vars: dict,
-        transfer_vars: dict,  # This variable is not actually used, but kept for signature consistency
         event_ids: list[int],
         current_squad: Optional[list[dict]],
         wildcard: Optional[bool] = False,
@@ -619,7 +617,7 @@ class TeamOptimizer:
         try:
             # Create model and variables
             print("Creating optimization model...")
-            model, player_vars, transfer_vars = self._create_optimization_model(
+            model, player_vars = self._create_optimization_model(
                 event_ids
             )
 
@@ -628,7 +626,6 @@ class TeamOptimizer:
             objective_terms = self._add_constraints(
                 model,
                 player_vars,
-                transfer_vars,
                 event_ids,
                 current_squad,
                 wildcard,
@@ -663,7 +660,6 @@ class TeamOptimizer:
                 return self._process_solution(
                     solver,
                     player_vars,
-                    transfer_vars,
                     event_ids,
                     current_squad,
                 )
@@ -745,7 +741,7 @@ class TeamOptimizer:
 
             if player.team in playing_teams:
                 # Use 'points_per_game' for actual scoring, not the optimization metric
-                ppg = player.points_per_game
+                ppg = player.form if self.scoring_metric == "form" else player.points_per_gamepoints_per_game
 
                 player_data = {
                     "id": player.id,
@@ -785,7 +781,6 @@ class TeamOptimizer:
         self,
         solver: cp_model.CpSolver,
         player_vars: dict,
-        transfer_vars: dict,
         event_ids: list[int],
         current_squad: Optional[list[dict]],
     ) -> dict:
@@ -847,7 +842,7 @@ class TeamOptimizer:
 
         # Collate transfers
         transfers_by_event = {
-            event_id: {"in": [], "out": []} for event_id in sorted_events
+            event_id: [] for event_id in sorted_events  # Each event will just contain an array of transfers
         }
         paid_transfers_total = 0
 
@@ -861,7 +856,19 @@ class TeamOptimizer:
 
             for phase, phase_events in phases.items():
                 phase_transfers_in_count = 0
+                phase_transfers = []  # Track transfers for this phase
+                
+                # Use the same free transfer logic as in optimization
+                phase_free_transfers = (
+                    self.free_transfers if phase == min(phases.keys())
+                    else self.config.FREE_TRANSFERS
+                )
+
+                # First collect all transfers for this phase
                 for event_id in phase_events:
+                    event_transfers_in = []
+                    event_transfers_out = []
+                    
                     for player in self.players:
                         if (
                             solver.Value(
@@ -869,12 +876,7 @@ class TeamOptimizer:
                             )
                             == 1
                         ):
-                            transfers_by_event[event_id]["in"].append(
-                                {
-                                    "phase": phase,
-                                    "player": self._process_player_for_output(player),
-                                }
-                            )
+                            event_transfers_in.append(player)
                             phase_transfers_in_count += 1
                         if (
                             solver.Value(
@@ -882,16 +884,66 @@ class TeamOptimizer:
                             )
                             == 1
                         ):
-                            transfers_by_event[event_id]["out"].append(
-                                {
-                                    "phase": phase,
-                                    "player": self._process_player_for_output(player),
-                                }
-                            )
+                            event_transfers_out.append(player)
+                    
+                    # Match transfers in/out and calculate net value
+                    for in_player, out_player in zip(event_transfers_in, event_transfers_out):
+                        transfer_number = len(phase_transfers) + 1
+                        is_paid = transfer_number > phase_free_transfers
+                        penalty = self.config.TRANSFER_PENALTY if is_paid else 0
+                        
+                        # Calculate actual contribution for remaining events
+                        remaining_events = [e for e in sorted_events if e >= event_id]
+                        
+                        in_player_contributions = []
+                        out_player_contributions = []
+                        
+                        # For the outgoing player, we need to look at events where they would have played
+                        # if they hadn't been transferred out
+                        prev_event = event_id - 1 if event_id > min(sorted_events) else event_id
+                        was_in_squad = (
+                            solver.Value(self.player_in_squad_vars[(out_player.id, prev_event)]) == 1
+                            if prev_event >= min(sorted_events)
+                            else True  # If it's the first event and they're being transferred out, they were in squad
+                        )
+                        
+                        for future_event in remaining_events:
+                            playing_teams = self._get_playing_teams(future_event)
+                            
+                            # For incoming player, check if they're actually in squad after transfer
+                            if in_player.team in playing_teams and solver.Value(self.player_in_squad_vars[(in_player.id, future_event)]) == 1:
+                                in_player_contributions.append(in_player.get_score(self.scoring_metric))
+                            
+                            # For outgoing player, check what games they would have played if not transferred
+                            # (i.e., if their team plays and they were in the squad before transfer)
+                            if out_player.team in playing_teams and was_in_squad:
+                                out_player_contributions.append(out_player.get_score(self.scoring_metric))
+                        
+                        points_gained = sum(in_player_contributions)
+                        points_lost = sum(out_player_contributions)
+                        net_points = points_gained - points_lost - penalty
+                        
+                        transfer_info = {
+                            "phase": phase,
+                            "transfer_number": transfer_number,
+                            "is_paid": is_paid,
+                            "penalty": penalty,
+                            "points_gained": points_gained,
+                            "points_lost": points_lost,
+                            "net_points": net_points,
+                            "games_gained": len(in_player_contributions),
+                            "games_lost": len(out_player_contributions),
+                            "in": self._process_player_for_output(in_player),
+                            "out": self._process_player_for_output(out_player),
+                        }
+                        phase_transfers.append(transfer_info)
+                        
+                        # Add transfer info directly to the event's transfer array
+                        transfers_by_event[event_id].append(transfer_info)
 
-                paid_transfers_total += max(
-                    0, phase_transfers_in_count - self.free_transfers
-                )
+                # Calculate paid transfers for this phase
+                phase_paid_transfers = max(0, phase_transfers_in_count - phase_free_transfers)
+                paid_transfers_total += phase_paid_transfers
 
         elif current_squad:
             # Fallback for simple case: Compare initial and final
@@ -908,23 +960,31 @@ class TeamOptimizer:
             if first_event is not None:
                 for p_id in t_in_ids:
                     if p_id in self.player_map:
-                        transfers_by_event[first_event]["in"].append(
-                            {
-                                "phase": phase_for_event,
-                                "player": self._process_player_for_output(
-                                    self.player_map[p_id]
-                                ),
-                            }
-                        )
-                for p_id in t_out_ids:
-                    if p_id in self.player_map:
-                        transfers_by_event[first_event]["out"].append(
-                            {
-                                "phase": phase_for_event,
-                                "player": self._process_player_for_output(
-                                    self.player_map[p_id]
-                                ),
-                            }
+                        # Create transfer info for each pair of in/out players
+                        transfer_number = len(transfers_by_event[first_event]) + 1
+                        is_paid = transfer_number > self.free_transfers
+                        penalty = self.config.TRANSFER_PENALTY if is_paid else 0
+                        
+                        transfer_info = {
+                            "phase": phase_for_event,
+                            "transfer_number": transfer_number,
+                            "is_paid": is_paid,
+                            "penalty": penalty,
+                            "points_gained": 0,  # Can't calculate without optimization
+                            "points_lost": 0,    # Can't calculate without optimization
+                            "net_points": -penalty,
+                            "games_gained": 0,   # Can't calculate without optimization
+                            "games_lost": 0,     # Can't calculate without optimization
+                            "in": self._process_player_for_output(self.player_map[p_id]),
+                            "out": None  # Will be set in the t_out_ids loop
+                        }
+                        transfers_by_event[first_event].append(transfer_info)
+
+                # Update the transfer info with out player details
+                for i, (p_id_in, p_id_out) in enumerate(zip(t_in_ids, t_out_ids)):
+                    if p_id_out in self.player_map:
+                        transfers_by_event[first_event][i]["out"] = self._process_player_for_output(
+                            self.player_map[p_id_out]
                         )
             paid_transfers_total = max(0, len(t_in_ids) - self.free_transfers)
 
@@ -932,10 +992,10 @@ class TeamOptimizer:
         transfers_by_event = {
             str(event_id): data
             for event_id, data in transfers_by_event.items()
-            if data["in"] or data["out"]
+            if data  # Keep events that have any transfers
         }
         total_transfers = sum(
-            len(transfers["in"]) for transfers in transfers_by_event.values()
+            len(transfers) for transfers in transfers_by_event.values()
         )
         total_games = sum(len(daily["starters"]) for daily in daily_starters.values())
         average_points_per_day = total_true_score / len(sorted_events)
@@ -956,5 +1016,10 @@ class TeamOptimizer:
                 "total": total_transfers,
                 "paid": paid_transfers_total,
                 "cost": paid_transfers_total * self.config.TRANSFER_PENALTY,
+                "total_net_points": sum(
+                    t["net_points"]
+                    for transfers in transfers_by_event.values()
+                    for t in transfers
+                ),
             },
         }
