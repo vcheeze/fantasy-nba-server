@@ -120,9 +120,14 @@ async def optimize(
             fixture for fixture in all_fixtures if fixture["event"] in gamedays
         ]
 
+        # Filter out players with 0 minutes to reduce player pool
+        active_players = [
+            player for player in data["elements"] if player["minutes"] > 0 and player["status"] in ["a", "d"]
+        ]
+
         # Run optimization
         optimizer = TeamOptimizer(
-            players=data["elements"],
+            players=active_players,
             fixtures=filtered_fixtures,
             phases=data["phases"],
             teams=data["teams"],

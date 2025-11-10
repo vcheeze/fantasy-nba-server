@@ -741,7 +741,7 @@ class TeamOptimizer:
 
             if player.team in playing_teams:
                 # Use 'points_per_game' for actual scoring, not the optimization metric
-                ppg = player.form if self.scoring_metric == "form" else player.points_per_gamepoints_per_game
+                ppg = player.form if self.scoring_metric == "form" else player.points_per_game
 
                 player_data = {
                     "id": player.id,
