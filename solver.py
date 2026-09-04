@@ -93,11 +93,13 @@ class TeamOptimizer:
         self.scoring_metric = scoring_metric
 
         # Calculate free transfers from transfers info if available
-        self.free_transfers = (
-            transfers.limit - transfers.made
-            if transfers is not None
-            else self.config.FREE_TRANSFERS
-        )
+        # Remaining free transfers for the upcoming phase. Clamp to [0, FREE_TRANSFERS]
+        if transfers is not None:
+            remaining = transfers.limit - transfers.made
+            # Ensure we don't end up with negative free transfers or more than config allows
+            self.free_transfers = max(0, min(remaining, self.config.FREE_TRANSFERS))
+        else:
+            self.free_transfers = self.config.FREE_TRANSFERS
         # self.free_transfers = self.config.FREE_TRANSFERS
 
         # Pre-compute team lookups before processing players
@@ -164,11 +166,15 @@ class TeamOptimizer:
 
     def _process_phases(self, phases: list[dict]) -> list[Phase]:
         """Process phases with field filtering."""
+        # Keep all supplied phases (don't skip the first element). Filter fields
+        # and return sorted Phase objects by id to ensure deterministic ordering.
         phase_fields = {field.name for field in fields(Phase)}
-        return [
+        processed = [
             Phase(**{k: v for k, v in p.items() if k in phase_fields})
             for p in phases[1:]
         ]
+        # Sort by id for stable behavior when taking min(phases.keys()) elsewhere
+        return sorted(processed, key=lambda ph: ph.id)
 
     def _get_gameweek_for_event(self, event_id: int) -> Optional[int]:
         """Get the gameweek (phase) ID for a given event ID."""
