@@ -44,6 +44,17 @@ def get_phase_ids_for_gamedays(data: dict, gamedays: list[int]) -> set[int]:
     return phase_ids
 
 
+def select_player_pool(elements: list[dict], picks: list[dict] | None) -> list[dict]:
+    """Drop players with 0 minutes to reduce the pool, but always keep the current squad."""
+    pick_ids = {p["element"] for p in picks or []}
+    return [p for p in elements if p["minutes"] > 0 or p["id"] in pick_ids]
+
+
+def get_next_event(data: dict) -> int | None:
+    """The gameday whose deadline is next, i.e. where pending transfers take effect."""
+    return next((e["id"] for e in data.get("events", []) if e.get("is_next")), None)
+
+
 async def fetch_fixtures(async_client, phase_ids: set[int]) -> list[dict]:
     """
     Fetch fixtures for all specified phase IDs in parallel.
@@ -79,6 +90,7 @@ async def optimize(
     points_column: str | None = "form",
     picks: list[dict] | None = None,
     transfers: Transfers | None = None,
+    wildcard: bool = False,
 ):
     """
     Optimize a fantasy team based on specified gamedays and constraints.
@@ -88,6 +100,7 @@ async def optimize(
         points_column: Metric to use for scoring (default: "form")
         picks: Current squad selection (optional)
         transfers: Transfer constraints (optional)
+        wildcard: Play the Wildcard on the first gameday (transfers that day are free)
 
     Returns:
         Optimized team selection
@@ -120,26 +133,18 @@ async def optimize(
             fixture for fixture in all_fixtures if fixture["event"] in gamedays
         ]
 
-        # Filter out players with 0 minutes to reduce player pool
-        active_players = [
-            player for player in data["elements"] if player["minutes"] > 0
-        ]
-
-        # Run optimization
         optimizer = TeamOptimizer(
-            players=active_players,
+            players=select_player_pool(data["elements"], picks),
             fixtures=filtered_fixtures,
             phases=data["phases"],
             teams=data["teams"],
             scoring_metric=points_column,
             current_squad=picks,
             transfers=transfers,
+            next_event=get_next_event(data),
+            wildcard=wildcard,
         )
-        result = optimizer.optimize(
-            event_ids=gamedays,
-            current_squad=picks,
-        )
-        return result
+        return optimizer.optimize(event_ids=gamedays)
 
     except HTTPException:
         # Re-raise HTTP exceptions without modification

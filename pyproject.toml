@@ -11,3 +11,12 @@ dependencies = [
     "pulp>=3.3.0",
     "typing>=3.10.0.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
