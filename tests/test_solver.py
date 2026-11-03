@@ -204,7 +204,7 @@ def test_non_contiguous_gamedays():
     assert_legal(result, players, fixtures, sum(s["selling_price"] for s in squad) + 300)
 
 
-def test_unlimited_transfers_status_makes_first_gameday_free():
+def test_null_transfer_limit_makes_first_gameday_free():
     players, fixtures = make_league(4)
     squad = legal_squad(players)
     transfers = Transfers(bank=300, cost=0, limit=None, made=0, status="unlimited", value=0)

@@ -210,9 +210,10 @@ class TeamOptimizer:
         self.current_squad_ids = {p["element"] for p in self.current_squad}
         self.next_event = next_event
 
-        # A null limit means transfers are currently unlimited (wildcard / pre-season)
-        unlimited = transfers is not None and transfers.limit is None
-        self.free_first_gameday = wildcard or unlimited
+        # A null limit means this gameday has no transfer cap. Later gamedays keep the normal allowance.
+        self.free_first_gameday = wildcard or (
+            transfers is not None and transfers.limit is None
+        )
         self.free_transfers = (
             max(0, transfers.limit - transfers.made)
             if transfers is not None and transfers.limit is not None
@@ -332,7 +333,7 @@ class TeamOptimizer:
         return self.config.FREE_TRANSFERS
 
     def _is_free_transfer_event(self, index: int) -> bool:
-        """Transfers on the first gameday are free when building a new squad or on a wildcard."""
+        """Transfers on the first gameday are free when building a new squad, on a wildcard, or when that gameday has no limit."""
         return index == 0 and (not self.current_squad_ids or self.free_first_gameday)
 
     def _group_chargeable_events(self, sorted_events: list[int]) -> dict:
@@ -500,7 +501,7 @@ class TeamOptimizer:
         if not self.current_squad_ids:
             transfer_note = "new squad, so transfers on the first gameday are free"
         elif self.free_first_gameday:
-            transfer_note = "wildcard, so transfers on the first gameday are free"
+            transfer_note = "no transfer limit on the first gameday"
         else:
             transfer_note = f"{self.free_transfers} free transfers left this gameweek"
         _log(
